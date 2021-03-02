@@ -10,7 +10,7 @@ from collections import namedtuple, defaultdict
 
 Var = namedtuple('Var', ('level', 'index'))
 
-Cover = namedtuple('Cover', ('B', 'F'))
+Cover = namedtuple('Cover', ('B_sets', 'F_set'))
 
 class Hrep:
     """Creates the linear H-representation for the given selection problem instance."""
@@ -18,18 +18,18 @@ class Hrep:
     def __init__(self, input_list: List[int]) -> None:
         self.input = input_list
         self.base_vars = bidict()  # bimaps variable to column position in h-rep
-        self.linearisation_vars = bidict()  # bimaps variable pair to column position in h-rep
         for i, length in enumerate(input_list):
             for j in range(length):
                 var = Var(level=i, index=j)
                 self.base_vars[var] = 1 + len(self.base_vars)
-
-        for i, j in combinations(range(len(input_list)), 2):
-            for index_i in range(input_list[i]):
-                for index_j in range(input_list[j]):
+        self.linearisation_vars = bidict()  # bimaps variable pair to column position in h-rep
+        for i, j in combinations(range(len(self.input)), 2):
+            for index_i in range(self.input[i]):
+                for index_j in range(self.input[j]):
                     var_i = Var(level=i, index=index_i)
                     var_j = Var(level=j, index=index_j)
-                    self.linearisation_vars[(var_i, var_j)] = 1 + len(self.base_vars) + len(self.linearisation_vars)
+                    self.linearisation_vars[(var_i, var_j)] = 1 + len(self.base_vars) + len(
+                        self.linearisation_vars)
 
     def get_glover_woolsey_rep(self) -> str:
         """Returns the h-representation based on the Glover-Woolsey linearisation:
@@ -88,6 +88,39 @@ class Hrep:
         rep += 'end'
         return rep
 
+    def get_extended_linearisation(self, *, f_weight: float, z_weight: float):
+        """Returns Liberti's extended linearisation based on B and F sets."""
+        cover = self._compute_cover_set(f_weight=f_weight, z_weight=z_weight)
+        for index_i, index_j in cover.F_set:
+            var_i = self.base_vars.inverse[index_i]
+            var_j = self.base_vars.inverse[index_j]
+            if (var_i, var_j) not in self.linearisation_vars:
+                self.linearisation_vars[(var_i, var_j)] = 1 + len(self.base_vars) + len(
+                    self.linearisation_vars)
+        num_rows = len(self.input) + 2*len(self.base_vars) + len(self.linearisation_vars) + 2*sum(
+            len(i) for i in cover.B_sets.values())
+        num_columns = 1 + len(self.base_vars) + len(self.linearisation_vars)
+        rep = f'extended-linearisation-{self.input}\n'
+        rep += 'H-representation\n'
+        linearity = str('linearity ') + str(len(self.input)) + ' ' + \
+                    ' '.join([str(x) for x in range(1, len(self.input) + 1)])
+        rep += linearity + '\n'
+        rep += 'begin\n'
+        rep += '{} {} integer\n'.format(num_rows, num_columns)
+        for card_cons in self._get_all_cardinality_cons(num_columns):
+            rep += card_cons
+        for nonneg_cons in self._get_all_nonnegativity_cons(num_columns):
+            rep += nonneg_cons
+        for lowerbound_cons in self._get_all_lowerbound_cons(num_columns):
+            rep += lowerbound_cons
+        for k in range(len(self.input)):
+            for j in cover.B_sets[k]:
+                cons1, cons2 = self._get_liberti_linearisation_cons(num_columns, j, k, cover.F_set)
+                rep += self._get_cons_as_string(cons1)
+                rep += self._get_cons_as_string(cons2)
+        rep += 'end'
+        return rep
+
     @staticmethod
     def _get_cons_as_string(cons: List[int]) -> str:
         """Returns the given constraint as a str with line break."""
@@ -110,7 +143,7 @@ class Hrep:
 
     def _get_all_nonnegativity_cons(self, num_columns: int) -> Generator[str, None, None]:
         """Returns non-negativity constraints for all variables."""
-        for column in chain(self.base_vars.values(), self.linearisation_vars.values()):
+        for column in range(1, num_columns):
             cons = self._get_nonnegativity_cons(num_columns, column)
             yield Hrep._get_cons_as_string(cons)
 
@@ -176,9 +209,24 @@ class Hrep:
         cons2[position_lin_var] = -2
         return cons1, cons2
 
-    def get_extended_linearisation(self, *, f_weight: float, z_weight: float):
-        cover = self._compute_cover_set(f_weight=f_weight, z_weight=z_weight)
-
+    def _get_liberti_linearisation_cons(self, num_columns: int, j: int, k: int, F: List[int]) -> Tuple[List[int], List[int]]:
+        """Returns the constraint:
+        sum_{i in A_k, (i,j) in F} u_ij + sum_{i in A_k, (j,i) in F} u_ji = x_j
+        """
+        cons1 = [0]*num_columns
+        cons2 = [0] * num_columns
+        A_k = [index for var, index in self.base_vars.items() if var.level == k]
+        ij = [(i, j) for i in A_k if (i, j) in F]
+        ji = [(j, i) for i in A_k if (j, i) in F]
+        for (index_u, index_v) in chain(ij, ji):
+            var_u = self.base_vars.inverse[index_u]
+            var_v = self.base_vars.inverse[index_v]
+            index = self.linearisation_vars[(var_u, var_v)]
+            cons1[index] = 1
+            cons2[index] = -1
+        cons1[j] = -1
+        cons2[j] = 1
+        return cons1, cons2
 
     def _compute_cover_set(self, *, z_weight: float, f_weight: float) -> Cover:
         """Create mip model for compute cover set B. See page 5 in 'Compact Linearization for Binary
@@ -240,12 +288,11 @@ class Hrep:
         solver.Minimize(z_obj + f_obj)
         # solve
         status = solver.Solve()
-        lp = solver.ExportModelAsLpFormat(False)
         if status == pywraplp.Solver.OPTIMAL:
             B = defaultdict(list)
             for i, k in (key for key, var in z_vars.items() if var.solution_value() > 0.99):
                 B[k].append(i)
             F = [key for key, var in f_vars.items() if var.solution_value() > 0.99]
-            return Cover(F=F, B=B)
+            return Cover(F_set=F, B_sets=B)
         else:
-            raise RuntimeError('Could not optimal solution.')
+            raise RuntimeError('No optimal solution found.')
