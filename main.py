@@ -31,6 +31,6 @@ if __name__ == '__main__':
     elif lin == Linearisation.COMPACT:
         print(hrep.get_compact_rep())
     elif lin == Linearisation.EXTENDED:
-        logging.info('Not implemented yet.')
+        hrep.get_extended_linearisation(f_weight=1., z_weight=1.)
     else:
         logging.error('Unexpected linearisation.')
